@@ -17,8 +17,8 @@ PIXEL = 3             # size of one pixel on screen (3 = smaller cat, 5 = bigger
 WINDOW_W = 160
 WINDOW_H = 140
 SLEEP_AFTER = 70000   # the cat falls asleep after this many milliseconds with no petting
-FOCUS_MINUTES = 0.5    # pomodoro focus time
-BREAK_MINUTES = 0.5    # pomodoro break time
+FOCUS_MINUTES = 30    # pomodoro focus time
+BREAK_MINUTES = 5    # pomodoro break time
 
 # ---------- What each letter means ----------
 COLORS = {
