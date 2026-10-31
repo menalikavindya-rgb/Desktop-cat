@@ -2,23 +2,34 @@ import sys
 import os
 import math
 import random
+import time
 from PySide6.QtWidgets import QApplication, QWidget, QMenu
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPainter, QColor, QFont, QCursor
-from PySide6.QtMultimedia import QSoundEffect
+
+# Sound: pygame plays the purr and the meow (install it with:  py -3.12 -m pip install pygame)
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 # These are only needed on Windows, to find the window you are using
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
 
+def resource_path(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
 # ---------- Settings you can change ----------
 PIXEL = 3             # size of one pixel on screen (3 = smaller cat, 5 = bigger cat)
 WINDOW_W = 160
 WINDOW_H = 140
 SLEEP_AFTER = 70000   # the cat falls asleep after this many milliseconds with no petting
-FOCUS_MINUTES = 30    # pomodoro focus time
-BREAK_MINUTES = 5    # pomodoro break time
+FOCUS_MINUTES = 25    # pomodoro focus time
+BREAK_MINUTES = 5     # pomodoro break time
 
 # ---------- What each letter means ----------
 COLORS = {
@@ -93,6 +104,40 @@ CAT_SLEEP = [
     "KKKKKKKKKKKKKKKKKKKKKKKKKKKKK.",
 ]
 
+# ---------- Pose 6: yawning (eyes shut, big open mouth; only rows 5 to 9 change) ----------
+CAT_YAWN = list(CAT_AWAKE)
+CAT_YAWN[5] = "KWWWWWWWWWWWK...........KWWK.."
+CAT_YAWN[6] = "KWKKWWWWWKKWK...........KGGK.."
+CAT_YAWN[7] = "KPPWKKKKKWPPK...........KGGK.."
+CAT_YAWN[8] = "KWWKKKKKKKWWKKKKKKKKKKKKKKKK.."
+CAT_YAWN[9] = "KWWWKPPPKWWWKWWWWWWWWWWWK....."
+
+# ---------- Pose 7: lying on its back with the paws up (used while rolling on the floor) ----------
+CAT_BELLY = list(CAT_SLEEP)
+CAT_BELLY[8] = ".KPK.....KPK......KKK..KKK...."
+CAT_BELLY[9] = "KWPWKKKKKWPWK.....KPK..KPK...."
+CAT_BELLY[10] = "KWWWWWWWWWWWK.....KWK..KWK...."
+
+# ---------- A little butterfly (7 wide, 5 tall), two wing positions ----------
+BUTTERFLY_OPEN = [
+    "BB...BB",
+    "BBB.BBB",
+    "BBBKBBB",
+    ".BBKBB.",
+    "..BKB..",
+]
+BUTTERFLY_CLOSED = [
+    "..K.K..",
+    "..BKB..",
+    "..BKB..",
+    "..BKB..",
+    "...K...",
+]
+BUTTERFLY_COLORS = {
+    "B": QColor(120, 170, 255),   # blue wings
+    "K": QColor(60, 60, 60),      # body
+}
+
 # ---------- A little heart that floats up while you pet the cat ----------
 HEART = [
     ".RR.RR.",
@@ -107,8 +152,6 @@ HEART = [
 def find_active_window(my_hwnd, ratio):
     # Returns "me" if the cat itself is the active window,
     # None if there is no usable window, or (left, top, right) of the active window.
-    if sys.platform != "win32":
-        return None
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
@@ -138,6 +181,32 @@ def find_active_window(my_hwnd, ratio):
     except Exception:
         return None
 
+# ---------- The butterfly: its own tiny see-through window that flies around the screen ----------
+class Butterfly(QWidget):
+    def __init__(self):
+        super().__init__()
+        # WindowTransparentForInput lets your mouse clicks go straight through it
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.resize(30, 24)
+        self.wings_open = True
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setPen(Qt.NoPen)
+        if self.wings_open:
+            picture = BUTTERFLY_OPEN
+        else:
+            picture = BUTTERFLY_CLOSED
+        for row in range(len(picture)):
+            for col in range(len(picture[row])):
+                letter = picture[row][col]
+                if letter != ".":
+                    p.setBrush(BUTTERFLY_COLORS[letter])
+                    p.drawRect(4 + col * 3, 4 + row * 3, 3, 3)
+
 class Cat(QWidget):
     def __init__(self):
         super().__init__()
@@ -162,15 +231,11 @@ class Cat(QWidget):
         self.drag_offset = None
 
         # Step 5: sounds (purr.wav and meow.wav go in the same folder as cat.py)
-        folder = os.path.dirname(__file__)
-        self.purr = QSoundEffect()
-        self.purr.setSource(QUrl.fromLocalFile(os.path.join(folder, "purr.wav")))
-        self.purr.setLoopCount(-2)
-        self.purr.setVolume(0.3)
-        self.meow_path = os.path.join(folder, "meow.wav")
-        self.meow = QSoundEffect()
-        self.meow.setSource(QUrl.fromLocalFile(self.meow_path))
-        self.meow.setVolume(0.7)
+        self.purr_sound = None
+        self.meow_sound = None
+        self.purring = False
+        self.last_sound_time = 0
+        self.reset_sound()
 
         # Step 6: where the cat can stand and walk
         screen = QApplication.primaryScreen().availableGeometry()
@@ -229,6 +294,28 @@ class Cat(QWidget):
         self.bubble_text = ""
         self.bubble_ticks = 0
 
+        # Step 15: yawning
+        self.yawning = False
+        self.yawn_ticks = 0
+        self.yawn_then_sleep = False
+
+        # Step 16: rolling on the floor (sleep_pose is "loaf" or "belly")
+        self.sleep_pose = "loaf"
+        self.rolling = False
+        self.roll_ticks = 0
+        self.roll_dir = 1
+        self.roll_start_flip = 1
+        self.sleep_move_timer = QTimer()
+        self.sleep_move_timer.setSingleShot(True)
+        self.sleep_move_timer.timeout.connect(self.sleep_move)
+
+        # Step 17: chasing a butterfly
+        self.butterfly = Butterfly()
+        self.chasing_butterfly = False
+        self.butterfly_ticks = 0
+        self.bf_x = 0              # the middle of the butterfly
+        self.bf_dir = 1            # 1 = flying right, -1 = flying left
+
     # ----- speech bubble -----
     def show_bubble(self, text):
         self.bubble_text = text
@@ -246,32 +333,117 @@ class Cat(QWidget):
     # ----- sleeping -----
     def go_to_sleep(self):
         # Timer ran out: only sleep if nobody is petting, dragging or playing with the cat
-        if self.hovering or self.drag_offset is not None or self.chasing:
+        busy = self.hovering or self.drag_offset is not None or self.chasing
+        busy = busy or self.chasing_butterfly or self.yawning or self.rolling
+        if busy:
             self.sleep_timer.start(SLEEP_AFTER)
         else:
-            self.fall_asleep()
+            self.start_yawn(True)
 
     def fall_asleep(self):
         self.sleeping = True
         self.chasing = False
+        self.stop_butterfly()
+        self.yawning = False
+        self.rolling = False
+        self.sleep_pose = "loaf"
         self.walk_target_x = None
         self.velocity = -0.1
+        # Once in a while the sleeping cat rolls over
+        self.sleep_move_timer.start(random.randint(8000, 15000))
 
     def wake_up(self):
         # During a focus session the cat stays asleep
         if self.pomodoro == "focus":
             return
+        self.yawning = False
+        if self.rolling:
+            self.rolling = False
+            self.flip = self.roll_start_flip
+        self.sleep_pose = "loaf"
         if self.sleeping:
             self.sleeping = False
             self.velocity = 0.12   # a little stretch
         self.sleep_timer.start(SLEEP_AFTER)
 
+    # ----- yawning -----
+    def start_yawn(self, then_sleep):
+        if self.sleeping or self.yawning:
+            return
+        self.yawning = True
+        self.yawn_ticks = 80               # about 1.3 seconds
+        self.yawn_then_sleep = then_sleep
+        self.chasing = False
+        self.stop_butterfly()
+        self.rolling = False
+        self.walk_target_x = None
+        self.stop_purr()
+
+    def yawn_step(self):
+        self.yawn_ticks = self.yawn_ticks - 1
+        progress = 1.0 - self.yawn_ticks / 80
+        # Stretch up while yawning, then relax
+        self.target = 1.0 + 0.12 * math.sin(math.pi * progress)
+        if self.yawn_ticks <= 0:
+            self.yawning = False
+            if self.yawn_then_sleep:
+                self.fall_asleep()
+
+    # ----- rolling on the floor -----
+    def sleep_move(self):
+        # Timer ran out: the sleeping cat rolls over
+        if self.sleeping and not self.rolling and not self.in_air:
+            self.start_roll()
+
+    def start_roll(self):
+        if self.rolling or self.in_air or self.yawning:
+            return
+        self.rolling = True
+        self.roll_ticks = 60               # about 1 second
+        self.roll_dir = random.choice([-1, 1])
+        self.roll_start_flip = self.flip
+        self.walk_target_x = None
+        self.chasing = False
+        self.stop_butterfly()
+
+    def roll_step(self):
+        self.target = 1.0
+        self.roll_ticks = self.roll_ticks - 1
+        segment = self.roll_ticks // 10    # counts 5, 4, 3, 2, 1, 0
+
+        # Roll along the floor and turn around at the edges
+        x = self.x() + self.roll_dir * 2
+        if x < self.min_x or x > self.max_x:
+            self.roll_dir = -self.roll_dir
+            x = max(self.min_x, min(x, self.max_x))
+        self.move(x, self.y())
+
+        # Tumble: turn the other way every 10 ticks
+        if segment % 2 == 1:
+            self.flip = self.roll_start_flip
+        else:
+            self.flip = -self.roll_start_flip
+
+        if self.roll_ticks <= 0:
+            self.rolling = False
+            self.flip = self.roll_start_flip
+            if self.sleeping:
+                # Switch between lying on the back and sleeping in a loaf
+                if self.sleep_pose == "loaf":
+                    self.sleep_pose = "belly"
+                    self.sleep_move_timer.start(random.randint(4000, 8000))
+                else:
+                    self.sleep_pose = "loaf"
+                    self.sleep_move_timer.start(random.randint(8000, 15000))
+
     # ----- pomodoro -----
     def start_focus(self):
         self.pomodoro = "focus"
         self.pomodoro_timer.start(FOCUS_MINUTES * 60 * 1000)
-        self.purr.stop()
-        self.fall_asleep()
+        self.stop_purr()
+        self.start_yawn(True)
+        if self.sleeping:
+            self.sleep_pose = "loaf"
         self.show_bubble("Focus time. Shh!")
 
     def pomodoro_finished(self):
@@ -303,9 +475,57 @@ class Cat(QWidget):
             label = "Break"
         return label + ": " + str(minutes) + ":" + str(seconds).zfill(2) + " left"
 
+    # ----- sound -----
+    def reset_sound(self):
+        # Starts the sound system fresh and loads both sounds.
+        # We do this again after a quiet while, because the computer's sound
+        # device can go to sleep, and then the old connection stays silent.
+        if pygame is None:
+            return
+        try:
+            pygame.mixer.quit()
+            pygame.mixer.init()
+            purr_path = resource_path("purr.wav")
+            meow_path = resource_path("meow.wav")
+            if os.path.exists(purr_path):
+                self.purr_sound = pygame.mixer.Sound(purr_path)
+                self.purr_sound.set_volume(0.3)
+            else:
+                print("Cannot find the purr sound:", purr_path)
+            if os.path.exists(meow_path):
+                self.meow_sound = pygame.mixer.Sound(meow_path)
+                self.meow_sound.set_volume(0.7)
+            else:
+                print("Cannot find the meow sound:", meow_path)
+            self.purring = False
+        except Exception as error:
+            print("Could not start the sound:", error)
+        self.last_sound_time = time.time()
+
+    def refresh_sound_if_quiet(self):
+        # If no sound was started for 20 seconds, start the sound system fresh
+        if pygame is not None and time.time() - self.last_sound_time > 20:
+            self.reset_sound()
+
+    def start_purr(self):
+        if pygame is None or self.purring:
+            return
+        self.refresh_sound_if_quiet()
+        if self.purr_sound is not None:
+            self.purr_sound.play(loops=-1)    # -1 = repeat until we stop it
+            self.purring = True
+            self.last_sound_time = time.time()
+
+    def stop_purr(self):
+        if self.purr_sound is not None and self.purring:
+            self.purr_sound.stop()
+        self.purring = False
+
     def play_meow(self):
-        if os.path.exists(self.meow_path):
-            self.meow.play()
+        self.refresh_sound_if_quiet()
+        if self.meow_sound is not None:
+            self.meow_sound.play()
+            self.last_sound_time = time.time()
         else:
             QApplication.beep()
 
@@ -347,6 +567,77 @@ class Cat(QWidget):
         self.air_target_x = None
         self.velocity = 0.15     # stretch while jumping
         self.pounce_wait = 50
+
+    # ----- chasing a butterfly -----
+    def start_butterfly(self):
+        if self.pomodoro == "focus":
+            return
+        self.wake_up()
+        self.chasing = False
+        self.rolling = False
+        self.yawning = False
+        self.walk_target_x = None
+        self.chasing_butterfly = True
+        self.butterfly_ticks = 480          # the butterfly stays about 8 seconds
+
+        # The butterfly appears to one side of the cat
+        side = random.choice([-1, 1])
+        cat_middle = self.x() + WINDOW_W // 2
+        self.bf_x = cat_middle + side * 150
+        self.bf_x = max(self.min_x + WINDOW_W // 2, min(self.bf_x, self.max_x + WINDOW_W // 2))
+        self.bf_dir = random.choice([-1, 1])
+        self.butterfly.move(int(self.bf_x) - 15, self.ground_y + 25)
+        self.butterfly.show()
+
+    def stop_butterfly(self):
+        self.chasing_butterfly = False
+        self.butterfly.hide()
+
+    def move_butterfly(self):
+        self.butterfly_ticks = self.butterfly_ticks - 1
+        if self.butterfly_ticks <= 0:
+            self.stop_butterfly()
+            return
+
+        # Fly sideways, and sometimes turn around
+        self.bf_x = self.bf_x + self.bf_dir * 2.5
+        if random.random() < 0.01:
+            self.bf_dir = -self.bf_dir
+        left_edge = self.min_x + WINDOW_W // 2
+        right_edge = self.max_x + WINDOW_W // 2
+        if self.bf_x < left_edge:
+            self.bf_x = left_edge
+            self.bf_dir = 1
+        if self.bf_x > right_edge:
+            self.bf_x = right_edge
+            self.bf_dir = -1
+
+        # Flap the wings and float up and down
+        bf_y = self.ground_y + 25 + 15 * math.sin(self.tick * 0.08)
+        self.butterfly.wings_open = (self.tick // 5) % 2 == 0
+        self.butterfly.move(int(self.bf_x) - 15, int(bf_y))
+        self.butterfly.update()
+
+    def butterfly_chase_step(self):
+        cat_middle = self.x() + WINDOW_W // 2
+        self.target = 1.0 + 0.05 * math.sin(self.tick * 0.5)
+
+        # Look at the butterfly
+        if self.bf_x < cat_middle:
+            self.flip = 1
+        else:
+            self.flip = -1
+
+        # Close enough: jump! The butterfly flutters away. Otherwise run after it.
+        if abs(self.bf_x - cat_middle) < 30:
+            if self.pounce_wait == 0:
+                self.pounce()
+                self.bf_dir = random.choice([-1, 1])
+                self.bf_x = self.bf_x + self.bf_dir * 50
+        elif self.bf_x > cat_middle:
+            self.move(min(self.x() + 3, self.max_x), self.y())
+        else:
+            self.move(max(self.x() - 3, self.min_x), self.y())
 
     # ----- jumping and falling -----
     def fly(self):
@@ -419,13 +710,17 @@ class Cat(QWidget):
 
     # ----- wandering -----
     def choose_target(self):
-        if self.sleeping or self.chasing or self.in_air:
+        busy = self.sleeping or self.chasing or self.chasing_butterfly
+        busy = busy or self.yawning or self.rolling or self.in_air
+        if busy:
             return
         if self.drag_offset is None and not self.hovering:
             roll = random.random()
-            if roll < 0.15:
-                self.start_chase()      # 15%: chase the mouse (change to 0 to turn off)
-            elif roll < 0.7:
+            if roll < 0.10:
+                self.start_chase()          # 10%: chase the mouse (change to 0 to turn off)
+            elif roll < 0.20:
+                self.start_butterfly()      # 10%: chase a butterfly (change to 0 to turn off)
+            elif roll < 0.70:
                 self.walk_target_x = random.randint(self.min_x, self.max_x)
 
     def walk_step(self):
@@ -442,19 +737,30 @@ class Cat(QWidget):
 
     def update_spring(self):
         self.tick = self.tick + 1
+        self.check_hover()
         if self.bubble_ticks > 0:
             self.bubble_ticks = self.bubble_ticks - 1
         if self.pounce_wait > 0:
             self.pounce_wait = self.pounce_wait - 1
 
+        # The butterfly keeps flying, even while the cat is jumping
+        if self.chasing_butterfly:
+            self.move_butterfly()
+
         # What is the cat doing right now?
         if self.in_air:
             self.fly()
+        elif self.yawning:
+            self.yawn_step()
+        elif self.rolling:
+            self.roll_step()
         elif self.sleeping:
             # Breathing: the sleeping cat slowly gets a little bigger and smaller
             self.target = 1.0 + 0.03 * math.sin(self.tick * 0.06)
         elif self.chasing:
             self.chase_step()
+        elif self.chasing_butterfly:
+            self.butterfly_chase_step()
         elif self.walk_target_x is not None:
             self.walk_step()
         else:
@@ -466,25 +772,43 @@ class Cat(QWidget):
         self.scale_y = self.scale_y + self.velocity
         self.update()
 
-    # ----- mouse -----
-    def enterEvent(self, event):
+    # ----- hovering: we check where the mouse is 60 times per second -----
+    def check_hover(self):
+        pos = QCursor.pos()
+        cat_left = self.x() + WINDOW_W // 2 - 15 * PIXEL
+        cat_right = cat_left + 30 * PIXEL
+        cat_bottom = self.y() + 130
+        if self.sleeping:
+            cat_top = cat_bottom - 11 * PIXEL     # the sleeping cat is lower
+        else:
+            cat_top = cat_bottom - 18 * PIXEL
+        inside = cat_left <= pos.x() <= cat_right and cat_top <= pos.y() <= cat_bottom
+        if inside and not self.hovering:
+            self.start_hover()
+        elif not inside and self.hovering:
+            self.end_hover()
+
+    def start_hover(self):
         self.hovering = True
         if self.pomodoro == "focus":
             return              # no purring while you are focusing
         self.wake_up()
+        self.stop_butterfly()
         self.walk_target_x = None
         self.velocity = -0.08
-        self.purr.play()
+        self.start_purr()
 
-    def leaveEvent(self, event):
+    def end_hover(self):
         self.hovering = False
-        self.purr.stop()
+        self.stop_purr()
         self.sleep_timer.start(SLEEP_AFTER)
 
+    # ----- mouse clicks -----
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.wake_up()
             self.chasing = False
+            self.stop_butterfly()
             self.in_air = False
             self.walk_target_x = None
             self.drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -509,13 +833,22 @@ class Cat(QWidget):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
 
+        meow_action = menu.addAction("Meow")
         chase_action = menu.addAction("Chase my mouse")
-        sleep_action = menu.addAction("Sleep now")
+        butterfly_action = menu.addAction("Chase a butterfly")
+        yawn_action = menu.addAction("Yawn")
+        roll_action = menu.addAction("Roll on the floor")
+        sleep_action = menu.addAction("Yawn and go to sleep")
         window_action = menu.addAction("Sit on active window")
         window_action.setCheckable(True)
         window_action.setChecked(self.window_mode)
         if self.pomodoro == "focus":
             chase_action.setEnabled(False)
+            butterfly_action.setEnabled(False)
+            yawn_action.setEnabled(False)
+            sleep_action.setEnabled(False)
+        if self.sleeping:
+            yawn_action.setEnabled(False)
             sleep_action.setEnabled(False)
 
         menu.addSeparator()
@@ -534,11 +867,18 @@ class Cat(QWidget):
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
-        if chosen == chase_action:
+        if chosen == meow_action:
+            self.play_meow()
+        elif chosen == chase_action:
             self.start_chase()
+        elif chosen == butterfly_action:
+            self.start_butterfly()
+        elif chosen == yawn_action:
+            self.start_yawn(False)
+        elif chosen == roll_action:
+            self.start_roll()
         elif chosen == sleep_action:
-            self.purr.stop()
-            self.fall_asleep()
+            self.start_yawn(True)
         elif chosen == window_action:
             self.window_mode = window_action.isChecked()
         elif chosen == focus_action:
@@ -556,14 +896,31 @@ class Cat(QWidget):
         p.setPen(Qt.NoPen)
 
         # The tail wags faster when the cat is happy (petting or chasing)
-        if self.hovering or self.chasing:
+        if self.hovering or self.chasing or self.chasing_butterfly:
             wag_speed = 10
         else:
             wag_speed = 40
         tail_left = (self.tick // wag_speed) % 2 == 1
 
         # Choose which picture to draw
-        if self.sleeping:
+        if self.rolling:
+            # While rolling, switch between the loaf and the belly-up picture
+            segment = self.roll_ticks // 10
+            if self.sleep_pose == "loaf":
+                first = CAT_SLEEP
+                second = CAT_BELLY
+            else:
+                first = CAT_BELLY
+                second = CAT_SLEEP
+            if segment % 2 == 1:
+                picture = first
+            else:
+                picture = second
+        elif self.yawning:
+            picture = CAT_YAWN
+        elif self.sleeping and self.sleep_pose == "belly":
+            picture = CAT_BELLY
+        elif self.sleeping:
             picture = CAT_SLEEP
         elif self.blinking and tail_left:
             picture = CAT_BLINK_B

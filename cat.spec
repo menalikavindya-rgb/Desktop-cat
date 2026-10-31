@@ -5,7 +5,7 @@ a = Analysis(
     ['cat.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('purr.wav', '.'), ('meow.wav', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
