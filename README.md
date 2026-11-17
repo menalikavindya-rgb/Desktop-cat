@@ -139,10 +139,5 @@ The finished program appears in the `dist` folder. With `--noconsole` you won't 
 - Works on the main monitor only
 - Maximized, minimized, and very small windows are ignored, so the cat stays at the bottom of the screen
 
-## Ideas for the future
 
-- Point at unread email or notifications
-- An optional AI chat bubble
-- More poses and outfits
-- Sit on more than one monitor
 
